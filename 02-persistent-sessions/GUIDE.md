@@ -4,7 +4,7 @@
 
 Module 01's bot is stateless — every message is independent. But real conversations need context. When you say "Make it shorter," the assistant needs to know what "it" refers to.
 
-The Anthropic API is also stateless. It doesn't remember previous calls. The `messages` array you send IS the conversation history. If you want multi-turn conversations, you must store and replay the full history.
+The OpenRouter API (which speaks the OpenAI Chat Completions shape) is also stateless. The provider never stores anything between calls. The `messages` array you send IS the conversation history. If you want multi-turn conversations, you must store and replay the full history yourself.
 
 ## Why JSONL
 

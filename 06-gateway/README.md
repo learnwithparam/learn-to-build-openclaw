@@ -19,7 +19,7 @@
 ## Prerequisites
 
 - Completed module 05
-- Anthropic API key and Telegram bot token in `.env`
+- OpenRouter API key and Telegram bot token in `.env`
 
 ## How to Run
 

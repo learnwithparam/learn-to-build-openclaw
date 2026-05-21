@@ -11,7 +11,7 @@
 
 ## What You'll Learn
 
-- How tool definitions work in the Anthropic API
+- How tool definitions work in the OpenRouter API
 - The agent loop pattern (the most important pattern in AI agents)
 - How to serialize mixed content (text + tool calls) for persistence
 - The execute/dispatch pattern for routing tool calls
@@ -28,7 +28,7 @@
 ## Prerequisites
 
 - Completed module 03
-- Anthropic API key and Telegram bot token in `.env`
+- OpenRouter API key and Telegram bot token in `.env`
 
 ## How to Run
 

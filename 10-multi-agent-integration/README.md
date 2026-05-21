@@ -28,7 +28,7 @@
 ## Prerequisites
 
 - Completed module 09
-- Anthropic API key in `.env`
+- OpenRouter API key in `.env`
 
 ## How to Run
 

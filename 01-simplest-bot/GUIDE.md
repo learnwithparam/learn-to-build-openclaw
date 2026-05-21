@@ -19,9 +19,9 @@ python-telegram-bot library
     v
 handle_message(update, context)
     |
-    | (Anthropic API call)
+    | (OpenRouter API call)
     v
-response.content[0].text -> reply_text()
+response.choices[0].message.content -> reply_text()
 ```
 
 The `python-telegram-bot` library handles all the HTTP communication with Telegram's servers. You just write handler functions.
@@ -29,7 +29,7 @@ The `python-telegram-bot` library handles all the HTTP communication with Telegr
 ## The API Call Anatomy
 
 ```python
-response = client.messages.create(
+response = client.chat.completions.create(
     model=MODEL,
     max_tokens=1024,
     messages=[{"role": "user", "content": user_text}],
@@ -41,7 +41,7 @@ This single call is doing a lot:
 - `max_tokens` — Maximum response length
 - `messages` — The conversation history (just one message here)
 
-The response contains `content`, which is a list of content blocks. For text responses, `response.content[0].text` gives you the reply.
+The response contains `content`, which is a list of content blocks. For text responses, `response.choices[0].message.content` gives you the reply.
 
 ## What Makes This Stateless
 

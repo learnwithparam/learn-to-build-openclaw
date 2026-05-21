@@ -5,7 +5,7 @@
 **Goal**: Understand every line of the bot.
 
 1. Open `bot.py` and identify:
-   - Where is the **Anthropic API call**?
+   - Where is the **OpenRouter API call**?
    - Where is the **Telegram message handler**?
    - Where does the **response get sent back**?
 2. Write down in your own words: what does each section do?

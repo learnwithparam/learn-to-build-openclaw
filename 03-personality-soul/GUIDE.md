@@ -2,27 +2,27 @@
 
 ## System Prompt vs First Message
 
-The Anthropic API has a dedicated `system` parameter, separate from the `messages` array. This matters:
+In the OpenAI Chat Completions shape (which OpenRouter speaks), the system prompt is the first message in the `messages` array with `role: "system"`:
 
 ```python
 # System prompt — shapes ALL responses
-response = client.messages.create(
-    system=SOUL,          # <-- Always present, never in history
-    messages=messages,     # <-- User/assistant turns only
+messages = [{"role": "system", "content": SOUL}] + history
+
+response = client.chat.completions.create(
+    model=MODEL,
+    messages=messages,
 )
 ```
 
-The system prompt:
-- Is always "above" the conversation — the model sees it first
-- Never appears in the message history
-- Survives session resets and context compaction (module 07)
-- Applies equally to all users
+We keep the system message **outside** the persisted `history` list and prepend it on every call. That way:
+- Identity is always "above" the conversation — the model sees it first
+- The saved JSONL session only contains user/assistant/tool turns
+- The bot's identity survives session resets and context compaction (module 07)
+- The same `history` works with any model (just swap `OPENROUTER_MODEL`)
 
 ## Why SOUL Survives Compaction
 
-When a conversation gets too long (module 07), we'll summarize old messages. But the system prompt is never part of the messages array — it's a separate parameter. This means the bot's identity is never summarized away or lost.
-
-This is why we put identity in `system` rather than as the first user/assistant message.
+When a conversation gets too long (module 07), we'll summarize old messages. But the system message is never inside the persisted history — it's prepended fresh on each call. That means the bot's identity is never summarized away or lost, no matter how many times we compact.
 
 ## Designing a Good SOUL.md
 
@@ -68,7 +68,7 @@ Only two lines of code changed:
 SOUL = (BOT_DIR / "SOUL.md").read_text()
 
 # Changed: Add system parameter
-response = client.messages.create(
+response = client.chat.completions.create(
     model=MODEL,
     max_tokens=1024,
     system=SOUL,       # <-- This is new

@@ -6,18 +6,21 @@ Module 03 was a chatbot — it could only respond with text. Module 04 is an age
 
 ## Tool Schema Design
 
-Each tool is defined with a name, description, and input schema:
+Each tool follows the OpenAI function-calling schema (which OpenRouter supports for every model that does tool use):
 
 ```python
 {
-    "name": "run_command",
-    "description": "Run a shell command and return stdout + stderr.",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "command": {"type": "string", "description": "The shell command to execute"}
+    "type": "function",
+    "function": {
+        "name": "run_command",
+        "description": "Run a shell command and return stdout + stderr.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {"type": "string", "description": "The shell command to execute"}
+            },
+            "required": ["command"],
         },
-        "required": ["command"],
     },
 }
 ```
@@ -30,43 +33,43 @@ This is the core pattern behind every AI agent:
 
 ```python
 while True:
-    response = client.messages.create(
+    messages = [{"role": "system", "content": SOUL}] + history
+    response = client.chat.completions.create(
         model=MODEL,
-        system=SOUL,
         tools=TOOLS,
         messages=messages,
     )
 
-    # Append assistant message to history
-    messages.append({"role": "assistant", "content": ...})
+    msg = response.choices[0].message
+    # Append assistant message (with tool_calls if any) to history
+    history.append({"role": "assistant", "content": msg.content or "", "tool_calls": msg.tool_calls or None})
 
-    # If no tool calls, we're done
-    if response.stop_reason != "tool_use":
-        return extract_text(response)
+    # If the model didn't call any tools, we're done
+    if not msg.tool_calls:
+        return msg.content or "Done."
 
-    # Execute tools, append results
-    for block in response.content:
-        if block.type == "tool_use":
-            result = execute_tool(block.name, block.input)
-            # Add tool result to messages
+    # Execute tools, append results as 'tool' messages
+    for tc in msg.tool_calls:
+        args = json.loads(tc.function.arguments)
+        result = execute_tool(tc.function.name, args)
+        history.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
     # Loop continues — model sees tool results and decides next action
 ```
 
-The key insight: **the model decides when to stop**. It keeps calling tools until it has enough information to answer, then it responds with text and `stop_reason` changes from `"tool_use"` to `"end_turn"`.
+The key insight: **the model decides when to stop**. It keeps calling tools until it has enough information to answer, then it responds with text and `msg.tool_calls` is empty.
 
-## Content Blocks
+## Tool Calls Shape
 
-Anthropic's API returns content as a list of blocks, not a plain string:
+In OpenAI/OpenRouter responses, an assistant message can have both text content AND a list of tool calls:
 
 ```python
-response.content = [
-    TextBlock(type="text", text="Let me check that file."),
-    ToolUseBlock(type="tool_use", id="toolu_123", name="read_file", input={"path": "bot.py"}),
-]
+msg = response.choices[0].message
+msg.content      # "Let me check that file."  (may be None when only calling tools)
+msg.tool_calls   # [ToolCall(id="call_abc", function=Function(name="read_file", arguments='{"path": "bot.py"}'))]
 ```
 
-A single response can contain both text and tool calls. You need to handle both when building the message history.
+Note that `arguments` is a **JSON string**, not a dict — you call `json.loads()` to decode it. A single response can contain both text and tool calls, so we always handle both when building the message history.
 
 ## The execute_tool Dispatch Pattern
 
@@ -88,36 +91,30 @@ The result goes back into the conversation as a `tool_result` message, and the m
 
 ## Tool Results in Message History
 
-Tool results use a special format in the Anthropic API:
+A tool result lives in its own message with `role: "tool"` and the matching `tool_call_id`:
 
 ```python
-messages.append({
-    "role": "user",
-    "content": [{
-        "type": "tool_result",
-        "tool_use_id": block.id,     # Must match the tool_use block's id
-        "content": result_string,
-    }]
+history.append({
+    "role": "tool",
+    "tool_call_id": tc.id,       # Must match the assistant's tool_call id
+    "content": result_string,
 })
 ```
 
-Each `tool_result` must reference the `tool_use_id` from the assistant's request. This is how the model knows which result corresponds to which tool call.
+This is how the model knows which result corresponds to which tool call. If the assistant requested two tools in parallel, you append two `role: "tool"` messages — one per call.
 
 ## Session Storage Changes
 
-In module 02, we stored simple text messages. Now we need to store structured content (text blocks + tool use blocks). The session format changes from:
+In module 02, we stored plain user/assistant messages. Now an assistant message can also carry a `tool_calls` list:
 
 ```json
-{"role": "assistant", "content": "Hello!"}
+{"role": "user",      "content": "What files are here?"}
+{"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "run_command", "arguments": "{\"command\": \"ls\"}"}}]}
+{"role": "tool",      "tool_call_id": "call_1", "content": "bot.py\nREADME.md"}
+{"role": "assistant", "content": "There are two files: bot.py and README.md."}
 ```
 
-To:
-
-```json
-{"role": "assistant", "content": [{"type": "text", "text": "Let me check..."}, {"type": "tool_use", "id": "toolu_123", "name": "read_file", "input": {"path": "bot.py"}}]}
-```
-
-This is why we switch from `append_message` to `save_session` — the full session gets rewritten after each agent turn.
+This is why we switch from `append_message` to `save_session` — the full session gets rewritten after each agent turn so the tool-call / tool-result IDs stay paired correctly.
 
 ---
 

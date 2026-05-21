@@ -4,14 +4,14 @@
 
 ## What You'll Learn
 
-- How to connect a Telegram bot to the Anthropic API
+- How to connect a Telegram bot to the OpenRouter API
 - That a working AI assistant can be built in ~20 lines
 - Why statelessness is a problem you'll solve in the next module
 
 ## Prerequisites
 
 - Python 3.10+ installed
-- Anthropic API key and Telegram bot token configured in `.env`
+- OpenRouter API key and Telegram bot token configured in `.env`
 - `make install` completed
 
 ## How to Run
@@ -33,7 +33,7 @@ Then open Telegram and send a message to your bot.
 ## Key Concept
 
 ```
-User Message → Telegram → bot.py → Anthropic API → Reply
+User Message → CLI or Telegram → bot.py → OpenRouter API → Reply
 ```
 
 No history, no state, no persistence. Just a single API call per message.

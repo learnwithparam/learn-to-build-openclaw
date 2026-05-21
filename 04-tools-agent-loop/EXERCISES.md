@@ -35,21 +35,24 @@
 1. Add a `list_directory` tool to the TOOLS array:
    ```python
    {
-       "name": "list_directory",
-       "description": "List files and directories at the given path.",
-       "input_schema": {
-           "type": "object",
-           "properties": {
-               "path": {"type": "string", "description": "Directory path to list"}
+       "type": "function",
+       "function": {
+           "name": "list_directory",
+           "description": "List files and directories at the given path.",
+           "parameters": {
+               "type": "object",
+               "properties": {
+                   "path": {"type": "string", "description": "Directory path to list"}
+               },
+               "required": ["path"],
            },
-           "required": ["path"],
        },
    }
    ```
 2. Add the handler in `execute_tool`:
    ```python
    elif name == "list_directory":
-       entries = os.listdir(input.get("path", "."))
+       entries = os.listdir(args.get("path", "."))
        return "\n".join(entries)
    ```
 3. Test it: "What's in the parent directory?"
