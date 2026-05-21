@@ -1,6 +1,12 @@
 # Learn to Build OpenClaw
 
-Learn how persistent AI assistants work by rebuilding OpenClaw from first principles — starting with a 20-line Telegram bot and incrementally adding sessions, personality, tools, permissions, a multi-channel gateway, context compaction, memory, scheduling, and multi-agent routing.
+Learn how persistent AI assistants work by rebuilding OpenClaw from first principles — starting with a tiny bot and incrementally adding sessions, personality, tools, permissions, a multi-channel gateway, context compaction, memory, scheduling, and multi-agent routing.
+
+The workshop runs on **OpenRouter** (default model: [`qwen/qwen3-coder`](https://openrouter.ai/qwen/qwen3-coder)) so you get cheap, accurate coding-model output without locking the workshop to any single provider. Swap `OPENROUTER_MODEL` to try DeepSeek, Haiku, or any other OpenRouter model.
+
+Every module ships with two ways to run it:
+- **CLI mode** (default) — a terminal REPL. No Telegram setup needed.
+- **Telegram mode** — pass `--telegram` to run as a real Telegram bot.
 
 Based on [Nader Dabit's blog post](https://www.nader.fyi/building-openclaw-personal-ai-assistant) on building a personal AI assistant.
 
@@ -8,7 +14,7 @@ Based on [Nader Dabit's blog post](https://www.nader.fyi/building-openclaw-perso
 
 | # | Module | Core Addition | Key Insight | Lines |
 |---|--------|---------------|-------------|-------|
-| 01 | [Simplest Bot](./01-simplest-bot/) | Telegram + Anthropic API | An AI bot is just an API call wrapped in a message handler | ~20 |
+| 01 | [Simplest Bot](./01-simplest-bot/) | OpenRouter call + CLI/Telegram channel | An AI bot is just an API call wrapped in a message handler | ~50 |
 | 02 | [Persistent Sessions](./02-persistent-sessions/) | JSONL per-user storage | JSONL is the simplest crash-safe persistence format | ~80 |
 | 03 | [Personality & Soul](./03-personality-soul/) | System prompt + SOUL.md | The system prompt IS the agent's identity | ~90 |
 | 04 | [Tools & Agent Loop](./04-tools-agent-loop/) | 4 tools + agent loop | The agent loop turns a chatbot into an agent | ~200 |
@@ -38,8 +44,8 @@ Based on [Nader Dabit's blog post](https://www.nader.fyi/building-openclaw-perso
 
 - Python 3.10+
 - [uv](https://docs.astral.sh/uv/) (Python package manager)
-- An [Anthropic API key](https://console.anthropic.com/)
-- A [Telegram Bot Token](https://core.telegram.org/bots#how-do-i-create-a-bot) (talk to [@BotFather](https://t.me/BotFather))
+- An [OpenRouter API key](https://openrouter.ai/keys) — credits start at $1; `qwen/qwen3-coder` is one of the cheapest capable coding models on the platform
+- *(Optional)* a [Telegram Bot Token](https://core.telegram.org/bots#how-do-i-create-a-bot) only if you want to run modules in `--telegram` mode
 
 ### Setup
 
@@ -51,10 +57,11 @@ Based on [Nader Dabit's blog post](https://www.nader.fyi/building-openclaw-perso
 2.  **Configure environment**:
     ```bash
     cp .env.example .env
-    # Edit .env and add your ANTHROPIC_API_KEY and TELEGRAM_BOT_TOKEN
+    # Edit .env and add your OPENROUTER_API_KEY
+    # (TELEGRAM_BOT_TOKEN only needed for --telegram mode)
     ```
 
-3.  **Run the first bot**:
+3.  **Run the first bot in CLI mode**:
     ```bash
     make 01-simplest-bot
     ```
@@ -134,27 +141,30 @@ Start Here
 Every persistent AI assistant is built on this foundation:
 
 ```python
-from anthropic import Anthropic
+from openai import OpenAI
 
-client = Anthropic()
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ["OPENROUTER_API_KEY"],
+)
 
 def handle_message(user_id, text):
-    messages = load_session(user_id)
-    messages.append({"role": "user", "content": text})
+    history = load_session(user_id)
+    history.append({"role": "user", "content": text})
 
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        system=SOUL,
+    messages = [{"role": "system", "content": SOUL}] + history
+    response = client.chat.completions.create(
+        model=os.environ.get("OPENROUTER_MODEL", "qwen/qwen3-coder"),
         messages=messages,
     )
 
-    assistant_msg = response.content[0].text
-    messages.append({"role": "assistant", "content": assistant_msg})
-    save_session(user_id, messages)
-    return assistant_msg
+    reply = response.choices[0].message.content
+    history.append({"role": "assistant", "content": reply})
+    save_session(user_id, history)
+    return reply
 ```
 
-Load history, call the API, save the response. Everything else is refinement.
+Load history, call the API, save the response. Everything else is refinement. The OpenRouter base URL means you can swap the model line and target any provider on the platform (qwen, deepseek, claude, gpt, gemini, ...).
 
 ## Verifying Your Setup
 

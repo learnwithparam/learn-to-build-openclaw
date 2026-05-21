@@ -254,12 +254,18 @@ def test_pyproject():
 
     content = pyproject.read_text()
 
-    required_deps = ["anthropic", "python-telegram-bot", "flask", "schedule", "python-dotenv"]
+    required_deps = ["openai", "python-telegram-bot", "flask", "schedule", "python-dotenv"]
     for dep in required_deps:
         check(
             f"pyproject.toml includes {dep}",
             dep in content,
         )
+    # Should NOT include the old anthropic SDK
+    check(
+        "pyproject.toml does not still include anthropic",
+        "anthropic" not in content,
+        "anthropic SDK should be removed in favor of openai/OpenRouter",
+    )
 
 
 def test_code_progression():
@@ -294,12 +300,14 @@ def test_key_concepts():
     print("\nKey Concepts in Code")
 
     concept_checks = [
-        ("01-simplest-bot", "bot.py", "client.messages.create", "Anthropic API call"),
+        ("01-simplest-bot", "bot.py", "chat.completions.create", "OpenRouter API call"),
+        ("01-simplest-bot", "bot.py", "openrouter.ai/api/v1", "OpenRouter base URL"),
         ("02-persistent-sessions", "bot.py", "jsonl", "JSONL format"),
         ("02-persistent-sessions", "bot.py", "load_session", "Session loading"),
         ("03-personality-soul", "bot.py", "SOUL", "SOUL system prompt"),
         ("04-tools-agent-loop", "bot.py", "execute_tool", "Tool execution"),
         ("04-tools-agent-loop", "bot.py", "while True", "Agent loop"),
+        ("04-tools-agent-loop", "bot.py", "tool_calls", "Tool calls"),
         ("05-permission-controls", "bot.py", "check_command_safety", "Safety checks"),
         ("05-permission-controls", "bot.py", "DANGEROUS_PATTERNS", "Dangerous patterns"),
         ("06-gateway", "bot.py", "Flask", "Flask HTTP"),
@@ -326,6 +334,46 @@ def test_key_concepts():
 
 # --- Run all tests ---
 
+def test_env_example():
+    """Test that .env.example documents the new OpenRouter variables."""
+    print("\nEnvironment Variables")
+
+    env_example = WORKSHOP_DIR / ".env.example"
+    if not env_example.exists():
+        check(".env.example exists", False)
+        return
+
+    content = env_example.read_text()
+    check(".env.example mentions OPENROUTER_API_KEY", "OPENROUTER_API_KEY" in content)
+    check(".env.example mentions OPENROUTER_MODEL", "OPENROUTER_MODEL" in content)
+    check(".env.example mentions qwen/qwen3-coder default", "qwen/qwen3-coder" in content)
+    check(
+        ".env.example no longer mentions ANTHROPIC_API_KEY",
+        "ANTHROPIC_API_KEY" not in content,
+        "Should be replaced by OPENROUTER_API_KEY",
+    )
+
+
+def test_tool_call_shape():
+    """Smoke-test: load module 04 and verify TOOLS uses OpenAI function-call format."""
+    print("\nOpenAI Tool-Call Shape (offline)")
+
+    bot_path = WORKSHOP_DIR / "04-tools-agent-loop" / "bot.py"
+    if not bot_path.exists():
+        check("04 bot.py exists", False)
+        return
+
+    content = bot_path.read_text()
+    # OpenAI shape: each tool is {"type": "function", "function": {"name": ..., "parameters": ...}}
+    check("04 uses OpenAI tool shape (\"type\": \"function\")", '"type": "function"' in content)
+    check("04 uses 'parameters' (not Anthropic 'input_schema')", '"parameters"' in content)
+    check(
+        "04 does not still use Anthropic 'input_schema'",
+        '"input_schema"' not in content,
+        "input_schema is the Anthropic format",
+    )
+
+
 if __name__ == "__main__":
     print("=" * 60)
     print("  OpenClaw Workshop — Automated Tests")
@@ -337,6 +385,8 @@ if __name__ == "__main__":
     test_doc_content()
     test_makefile_targets()
     test_pyproject()
+    test_env_example()
+    test_tool_call_shape()
     test_code_progression()
     test_key_concepts()
 

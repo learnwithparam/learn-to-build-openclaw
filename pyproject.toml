@@ -1,11 +1,11 @@
 [project]
 name = "learn-to-build-openclaw"
 version = "0.1.0"
-description = "Learn to Build OpenClaw Workshop - Build a persistent AI assistant from scratch"
+description = "Learn to Build OpenClaw Workshop - Build a persistent AI assistant from scratch using OpenRouter (qwen3-coder)"
 authors = [{ name = "Param Harrison", email = "param@learnwithparam.com" }]
 requires-python = ">=3.10"
 dependencies = [
-    "anthropic>=0.40.0",
+    "openai>=1.50.0",
     "python-telegram-bot>=21.0",
     "flask>=3.0.0",
     "schedule>=1.2.0",

@@ -5,28 +5,34 @@
 Builds on 06 by adding:
   - estimate_tokens() — heuristic token counting (chars / 4)
   - compact_session() — split-summarize-merge strategy
-  - Automatic compaction before API calls when threshold is exceeded
+  - Automatic compaction before LLM calls when threshold is exceeded
 
 Usage:
-    uv run python 07-context-compaction/bot.py
+    uv run python 07-context-compaction/bot.py            # CLI
+    uv run python 07-context-compaction/bot.py --http     # CLI + HTTP
+    uv run python 07-context-compaction/bot.py --telegram # Telegram + HTTP
 """
 import json
 import os
 import re
 import subprocess
+import sys
 import threading
 from pathlib import Path
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
+from openai import OpenAI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
 load_dotenv(override=True)
 
-MODEL = "claude-sonnet-4-20250514"
-client = Anthropic()
+MODEL = os.environ.get("OPENROUTER_MODEL", "qwen/qwen3-coder")
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ["OPENROUTER_API_KEY"],
+)
 
 BOT_DIR = Path(__file__).parent
 SESSIONS_DIR = BOT_DIR / "sessions"
@@ -45,13 +51,11 @@ def estimate_tokens(messages: list[dict]) -> int:
     """Estimate token count using chars/4 heuristic."""
     total_chars = 0
     for msg in messages:
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            total_chars += len(content)
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict):
-                    total_chars += len(json.dumps(block))
+        content = msg.get("content") or ""
+        total_chars += len(content)
+        # Tool calls add structured payload
+        for tc in msg.get("tool_calls", []) or []:
+            total_chars += len(json.dumps(tc))
     return total_chars // 4
 
 
@@ -60,7 +64,7 @@ def compact_session(messages: list[dict]) -> list[dict]:
     Compact a session by summarizing old messages and keeping recent ones.
 
     Strategy: Split into old (to summarize) and recent (to keep verbatim).
-    Use Claude to summarize the old part into a single assistant message.
+    Use the LLM to summarize the old part into a single assistant message.
     """
     if len(messages) <= RECENT_KEEP:
         return messages
@@ -72,24 +76,17 @@ def compact_session(messages: list[dict]) -> list[dict]:
     old_text_parts = []
     for msg in old_messages:
         role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-        if isinstance(content, str):
+        content = msg.get("content") or ""
+        if content:
             old_text_parts.append(f"{role}: {content[:500]}")
-        elif isinstance(content, list):
-            # Summarize tool calls briefly
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
-                        old_text_parts.append(f"{role}: {block.get('text', '')[:500]}")
-                    elif block.get("type") == "tool_use":
-                        old_text_parts.append(f"{role}: [called {block.get('name', 'tool')}]")
-                    elif block.get("type") == "tool_result":
-                        old_text_parts.append(f"tool_result: {str(block.get('content', ''))[:200]}")
+        for tc in msg.get("tool_calls", []) or []:
+            name = tc.get("function", {}).get("name", "tool")
+            args_preview = tc.get("function", {}).get("arguments", "")[:100]
+            old_text_parts.append(f"{role}: [called {name}({args_preview})]")
 
     old_text = "\n".join(old_text_parts)
 
-    # Ask Claude to summarize
-    summary_response = client.messages.create(
+    summary_response = client.chat.completions.create(
         model=MODEL,
         max_tokens=1024,
         messages=[{
@@ -98,10 +95,9 @@ def compact_session(messages: list[dict]) -> list[dict]:
         }],
     )
 
-    summary = summary_response.content[0].text
+    summary = summary_response.choices[0].message.content or ""
     print(f"  [compaction] Summarized {len(old_messages)} messages into summary ({len(summary)} chars)")
 
-    # Return: summary as first assistant message + recent messages
     compacted = [
         {"role": "user", "content": "[Previous conversation summary follows]"},
         {"role": "assistant", "content": f"[Summary of earlier conversation]\n{summary}"},
@@ -154,87 +150,47 @@ def check_command_safety(command: str) -> str:
 # --- Tool definitions ---
 
 TOOLS = [
-    {
-        "name": "run_command",
-        "description": "Run a shell command. Subject to safety checks.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "The shell command to execute"}
-            },
-            "required": ["command"],
-        },
-    },
-    {
-        "name": "read_file",
-        "description": "Read the contents of a file.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Path to the file to read"}
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "write_file",
-        "description": "Write content to a file, creating directories as needed.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Path to write to"},
-                "content": {"type": "string", "description": "Content to write"},
-            },
-            "required": ["path", "content"],
-        },
-    },
-    {
-        "name": "web_search",
-        "description": "Search the web (placeholder).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query"}
-            },
-            "required": ["query"],
-        },
-    },
+    {"type": "function", "function": {"name": "run_command", "description": "Run a shell command. Subject to safety checks.",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The shell command to execute"}}, "required": ["command"]}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read the contents of a file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Path to the file to read"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "write_file", "description": "Write content to a file, creating directories as needed.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Path to write to"}, "content": {"type": "string", "description": "Content to write"}}, "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "web_search", "description": "Search the web (placeholder).",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}}, "required": ["query"]}}},
 ]
 
 
-def execute_tool(name: str, input: dict) -> str:
+def execute_tool(name: str, args: dict) -> str:
     if name == "run_command":
-        command = input["command"]
+        command = args["command"]
         safety = check_command_safety(command)
         if safety == "blocked":
             return f"BLOCKED: Command '{command}' matches a dangerous pattern."
         if safety == "needs_approval":
             save_approval(command)
         try:
-            result = subprocess.run(
-                command, shell=True, capture_output=True, text=True, timeout=30,
-            )
-            output = result.stdout + result.stderr
-            return output[:10000] or "Command completed with no output."
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+            return (result.stdout + result.stderr)[:10000] or "Command completed with no output."
         except subprocess.TimeoutExpired:
             return "Error: Command timed out after 30 seconds."
         except Exception as e:
             return f"Error: {e}"
     elif name == "read_file":
         try:
-            return Path(input["path"]).read_text()[:10000]
+            return Path(args["path"]).read_text()[:10000]
         except Exception as e:
             return f"Error reading file: {e}"
     elif name == "write_file":
         try:
-            path = Path(input["path"])
+            path = Path(args["path"])
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(input["content"])
-            return f"Wrote {len(input['content'])} chars to {input['path']}"
+            path.write_text(args["content"])
+            return f"Wrote {len(args['content'])} chars to {args['path']}"
         except Exception as e:
             return f"Error writing file: {e}"
     elif name == "web_search":
-        return f"[Web search placeholder] Query: {input['query']}"
+        return f"[Web search placeholder] Query: {args['query']}"
     return f"Unknown tool: {name}"
 
 
@@ -261,59 +217,47 @@ def save_session(user_id: str, messages: list[dict]):
 # --- Agent loop with compaction ---
 
 def run_agent_turn(user_id: str, user_text: str) -> str:
-    messages = load_session(user_id)
-    messages.append({"role": "user", "content": user_text})
+    history = load_session(user_id)
+    history.append({"role": "user", "content": user_text})
 
-    # Check if compaction is needed
-    tokens = estimate_tokens(messages)
+    # Compact before the API call if needed
+    tokens = estimate_tokens(history)
     if tokens > TOKEN_THRESHOLD:
         print(f"  [compaction] Session has ~{tokens} tokens, compacting...")
-        messages = compact_session(messages)
-        save_session(user_id, messages)
+        history = compact_session(history)
+        save_session(user_id, history)
 
     while True:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            system=SOUL,
-            tools=TOOLS,
-            messages=messages,
+        messages = [{"role": "system", "content": SOUL}] + history
+        response = client.chat.completions.create(
+            model=MODEL, max_tokens=4096, tools=TOOLS, messages=messages,
         )
+        msg = response.choices[0].message
 
-        assistant_content = []
-        for block in response.content:
-            if hasattr(block, "text"):
-                assistant_content.append({"type": "text", "text": block.text})
-            elif block.type == "tool_use":
-                assistant_content.append({
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": block.input,
-                })
+        assistant_msg = {"role": "assistant", "content": msg.content or ""}
+        if msg.tool_calls:
+            assistant_msg["tool_calls"] = [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in msg.tool_calls
+            ]
+        history.append(assistant_msg)
 
-        messages.append({"role": "assistant", "content": assistant_content})
+        if not msg.tool_calls:
+            save_session(user_id, history)
+            return msg.content or "Done."
 
-        if response.stop_reason != "tool_use":
-            save_session(user_id, messages)
-            text_parts = [b.text for b in response.content if hasattr(b, "text")]
-            return "\n".join(text_parts) or "Done."
-
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"  [tool] {block.name}({json.dumps(block.input)[:100]})")
-                result = execute_tool(block.name, block.input)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result,
-                })
-
-        messages.append({"role": "user", "content": tool_results})
+        for tc in msg.tool_calls:
+            try:
+                tool_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+            except json.JSONDecodeError:
+                tool_args = {}
+            print(f"  [tool] {tc.function.name}({json.dumps(tool_args)[:100]})")
+            result = execute_tool(tc.function.name, tool_args)
+            history.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
 
-# --- Channel: Telegram ---
+# --- Channels ---
 
 async def handle_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -331,8 +275,6 @@ def start_telegram():
     app.run_polling()
 
 
-# --- Channel: HTTP ---
-
 flask_app = Flask(__name__)
 
 
@@ -347,24 +289,44 @@ def http_chat():
 
 @flask_app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "model": MODEL})
 
 
 def start_http():
+    print("[http] Server running on http://localhost:5000")
     flask_app.run(host="0.0.0.0", port=5000, debug=False)
 
 
-# --- Main ---
+def start_cli():
+    user_id = "cli-user"
+    print(f"[cli] OpenClaw — model: {MODEL}. Type 'exit' to quit.\n")
+    while True:
+        try:
+            user_text = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if user_text in {"exit", "quit"}:
+            break
+        if not user_text:
+            continue
+        reply = run_agent_turn(user_id, user_text)
+        print(f"bot> {reply}\n")
+
 
 def main():
-    print("Starting gateway with context compaction...")
-    print(f"  Token threshold: {TOKEN_THRESHOLD}")
-    print(f"  Recent messages kept: {RECENT_KEEP}")
+    print(f"OpenClaw 07 — token threshold: {TOKEN_THRESHOLD}, keep recent: {RECENT_KEEP}")
 
-    http_thread = threading.Thread(target=start_http, daemon=True)
-    http_thread.start()
+    has_telegram = "--telegram" in sys.argv
+    has_http = "--http" in sys.argv or has_telegram
 
-    start_telegram()
+    if has_http:
+        threading.Thread(target=start_http, daemon=True).start()
+
+    if has_telegram:
+        start_telegram()
+    else:
+        start_cli()
 
 
 if __name__ == "__main__":

@@ -9,23 +9,28 @@ Builds on 04 by adding:
   - check_command_safety() with three-tier logic
 
 Usage:
-    uv run python 05-permission-controls/bot.py
+    uv run python 05-permission-controls/bot.py            # CLI mode
+    uv run python 05-permission-controls/bot.py --telegram # Telegram mode
 """
 import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
+from openai import OpenAI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
 load_dotenv(override=True)
 
-MODEL = "claude-sonnet-4-20250514"
-client = Anthropic()
+MODEL = os.environ.get("OPENROUTER_MODEL", "qwen/qwen3-coder")
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ["OPENROUTER_API_KEY"],
+)
 
 BOT_DIR = Path(__file__).parent
 SESSIONS_DIR = BOT_DIR / "sessions"
@@ -77,78 +82,87 @@ def check_command_safety(command: str) -> str:
       3. NEEDS_APPROVAL — check persistent approvals, else request approval
     Returns: "safe", "blocked", "approved", or "needs_approval"
     """
-    # Tier 1: Check dangerous patterns
     for pattern in DANGEROUS_PATTERNS:
         if re.search(pattern, command):
             return "blocked"
 
-    # Tier 2: Check safe commands
     first_word = command.strip().split()[0] if command.strip() else ""
     if first_word in SAFE_COMMANDS:
         return "safe"
 
-    # Tier 3: Check persistent approvals
     if command in load_approvals():
         return "approved"
 
     return "needs_approval"
 
 
-# --- Tool definitions ---
+# --- Tool definitions (OpenAI format) ---
 
 TOOLS = [
     {
-        "name": "run_command",
-        "description": "Run a shell command. Subject to safety checks.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "The shell command to execute"}
+        "type": "function",
+        "function": {
+            "name": "run_command",
+            "description": "Run a shell command. Subject to safety checks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "The shell command to execute"}
+                },
+                "required": ["command"],
             },
-            "required": ["command"],
         },
     },
     {
-        "name": "read_file",
-        "description": "Read the contents of a file.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Path to the file to read"}
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to the file to read"}
+                },
+                "required": ["path"],
             },
-            "required": ["path"],
         },
     },
     {
-        "name": "write_file",
-        "description": "Write content to a file, creating directories as needed.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Path to write to"},
-                "content": {"type": "string", "description": "Content to write"},
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file, creating directories as needed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Path to write to"},
+                    "content": {"type": "string", "description": "Content to write"},
+                },
+                "required": ["path", "content"],
             },
-            "required": ["path", "content"],
         },
     },
     {
-        "name": "web_search",
-        "description": "Search the web (placeholder).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query"}
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Search the web (placeholder).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"}
+                },
+                "required": ["query"],
             },
-            "required": ["query"],
         },
     },
 ]
 
 
-def execute_tool(name: str, input: dict) -> str:
+def execute_tool(name: str, args: dict) -> str:
     """Execute a tool with permission checks for run_command."""
     if name == "run_command":
-        command = input["command"]
+        command = args["command"]
         safety = check_command_safety(command)
 
         if safety == "blocked":
@@ -173,21 +187,21 @@ def execute_tool(name: str, input: dict) -> str:
 
     elif name == "read_file":
         try:
-            return Path(input["path"]).read_text()[:10000]
+            return Path(args["path"]).read_text()[:10000]
         except Exception as e:
             return f"Error reading file: {e}"
 
     elif name == "write_file":
         try:
-            path = Path(input["path"])
+            path = Path(args["path"])
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(input["content"])
-            return f"Wrote {len(input['content'])} chars to {input['path']}"
+            path.write_text(args["content"])
+            return f"Wrote {len(args['content'])} chars to {args['path']}"
         except Exception as e:
             return f"Error writing file: {e}"
 
     elif name == "web_search":
-        return f"[Web search placeholder] Query: {input['query']}"
+        return f"[Web search placeholder] Query: {args['query']}"
 
     return f"Unknown tool: {name}"
 
@@ -216,68 +230,96 @@ def save_session(user_id: str, messages: list[dict]):
 
 def run_agent_turn(user_id: str, user_text: str) -> str:
     """Run the agent loop with permission-checked tool execution."""
-    messages = load_session(user_id)
-    messages.append({"role": "user", "content": user_text})
+    history = load_session(user_id)
+    history.append({"role": "user", "content": user_text})
 
     while True:
-        response = client.messages.create(
+        messages = [{"role": "system", "content": SOUL}] + history
+
+        response = client.chat.completions.create(
             model=MODEL,
             max_tokens=4096,
-            system=SOUL,
             tools=TOOLS,
             messages=messages,
         )
 
-        assistant_content = []
-        for block in response.content:
-            if hasattr(block, "text"):
-                assistant_content.append({"type": "text", "text": block.text})
-            elif block.type == "tool_use":
-                assistant_content.append({
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": block.input,
-                })
+        msg = response.choices[0].message
 
-        messages.append({"role": "assistant", "content": assistant_content})
+        assistant_msg = {"role": "assistant", "content": msg.content or ""}
+        if msg.tool_calls:
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in msg.tool_calls
+            ]
+        history.append(assistant_msg)
 
-        if response.stop_reason != "tool_use":
-            save_session(user_id, messages)
-            text_parts = [b.text for b in response.content if hasattr(b, "text")]
-            return "\n".join(text_parts) or "Done."
+        if not msg.tool_calls:
+            save_session(user_id, history)
+            return msg.content or "Done."
 
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"  [tool] {block.name}({json.dumps(block.input)[:100]})")
-                result = execute_tool(block.name, block.input)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result,
-                })
+        for tc in msg.tool_calls:
+            try:
+                tool_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+            except json.JSONDecodeError:
+                tool_args = {}
+            print(f"  [tool] {tc.function.name}({json.dumps(tool_args)[:100]})")
+            result = execute_tool(tc.function.name, tool_args)
+            history.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": result,
+            })
 
-        messages.append({"role": "user", "content": tool_results})
 
-
-# --- Bot handler ---
+# --- Telegram channel ---
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
     user_text = update.message.text
-
     await update.message.reply_text("Working on it...")
     reply = run_agent_turn(user_id, user_text)
     await update.message.reply_text(reply[:4096])
 
 
-def main():
+def run_telegram():
     token = os.environ["TELEGRAM_BOT_TOKEN"]
     app = ApplicationBuilder().token(token).build()
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("Agent bot is running with permission controls!")
+    print(f"Agent bot running with permission controls — model: {MODEL}")
     app.run_polling()
+
+
+# --- CLI channel ---
+
+def run_cli():
+    user_id = "cli-user"
+    print(f"OpenClaw CLI (permissioned tools) — model: {MODEL}. Type 'exit' to quit.\n")
+    while True:
+        try:
+            user_text = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if user_text in {"exit", "quit"}:
+            break
+        if not user_text:
+            continue
+        reply = run_agent_turn(user_id, user_text)
+        print(f"bot> {reply}\n")
+
+
+def main():
+    if "--telegram" in sys.argv:
+        run_telegram()
+    else:
+        run_cli()
 
 
 if __name__ == "__main__":

@@ -9,26 +9,32 @@ Builds on 07 by adding:
   - Cross-session recall of saved knowledge
 
 Usage:
-    uv run python 08-long-term-memory/bot.py
+    uv run python 08-long-term-memory/bot.py            # CLI
+    uv run python 08-long-term-memory/bot.py --http     # CLI + HTTP
+    uv run python 08-long-term-memory/bot.py --telegram # Telegram + HTTP
 """
 import json
 import os
 import re
 import subprocess
+import sys
 import threading
 from datetime import datetime
 from pathlib import Path
 
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
+from openai import OpenAI
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
 load_dotenv(override=True)
 
-MODEL = "claude-sonnet-4-20250514"
-client = Anthropic()
+MODEL = os.environ.get("OPENROUTER_MODEL", "qwen/qwen3-coder")
+client = OpenAI(
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ["OPENROUTER_API_KEY"],
+)
 
 BOT_DIR = Path(__file__).parent
 SESSIONS_DIR = BOT_DIR / "sessions"
@@ -39,7 +45,7 @@ MEMORY_DIR.mkdir(exist_ok=True)
 # Enhanced SOUL with memory instructions
 SOUL = """# OpenClaw
 
-You are OpenClaw, a personal AI assistant running on Telegram.
+You are OpenClaw, a personal AI assistant.
 
 ## Personality
 - Helpful, concise, and technically competent
@@ -67,13 +73,10 @@ RECENT_KEEP = 10
 def estimate_tokens(messages: list[dict]) -> int:
     total_chars = 0
     for msg in messages:
-        content = msg.get("content", "")
-        if isinstance(content, str):
-            total_chars += len(content)
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict):
-                    total_chars += len(json.dumps(block))
+        content = msg.get("content") or ""
+        total_chars += len(content)
+        for tc in msg.get("tool_calls", []) or []:
+            total_chars += len(json.dumps(tc))
     return total_chars // 4
 
 
@@ -87,19 +90,15 @@ def compact_session(messages: list[dict]) -> list[dict]:
     old_text_parts = []
     for msg in old_messages:
         role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-        if isinstance(content, str):
+        content = msg.get("content") or ""
+        if content:
             old_text_parts.append(f"{role}: {content[:500]}")
-        elif isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
-                        old_text_parts.append(f"{role}: {block.get('text', '')[:500]}")
-                    elif block.get("type") == "tool_use":
-                        old_text_parts.append(f"{role}: [called {block.get('name', 'tool')}]")
+        for tc in msg.get("tool_calls", []) or []:
+            name = tc.get("function", {}).get("name", "tool")
+            old_text_parts.append(f"{role}: [called {name}]")
 
     old_text = "\n".join(old_text_parts)
-    summary_response = client.messages.create(
+    summary_response = client.chat.completions.create(
         model=MODEL,
         max_tokens=1024,
         messages=[{
@@ -107,7 +106,7 @@ def compact_session(messages: list[dict]) -> list[dict]:
             "content": f"Summarize this conversation concisely, preserving key facts:\n\n{old_text}",
         }],
     )
-    summary = summary_response.content[0].text
+    summary = summary_response.choices[0].message.content or ""
     print(f"  [compaction] Summarized {len(old_messages)} messages")
 
     return [
@@ -120,7 +119,6 @@ def compact_session(messages: list[dict]) -> list[dict]:
 
 def save_memory(topic: str, content: str) -> str:
     """Save a memory to a markdown file."""
-    # Sanitize topic for filename
     filename = re.sub(r'[^\w\s-]', '', topic).strip().replace(' ', '-').lower()
     if not filename:
         filename = "misc"
@@ -142,7 +140,6 @@ def memory_search(query: str) -> str:
 
     for filepath in MEMORY_DIR.glob("*.md"):
         text = filepath.read_text()
-        # Simple keyword matching
         matches = sum(1 for word in query_words if word in text.lower())
         if matches > 0:
             results.append((matches, filepath.stem, text[:500]))
@@ -150,7 +147,7 @@ def memory_search(query: str) -> str:
     if not results:
         return "No memories found matching that query."
 
-    results.sort(reverse=True)  # Most matches first
+    results.sort(reverse=True)
     output_parts = []
     for score, name, text in results[:5]:
         output_parts.append(f"--- {name} (relevance: {score}) ---\n{text}")
@@ -199,117 +196,63 @@ def check_command_safety(command: str) -> str:
     return "needs_approval"
 
 
-# --- Tool definitions (now with memory tools) ---
+# --- Tool definitions (with memory tools) ---
 
 TOOLS = [
-    {
-        "name": "run_command",
-        "description": "Run a shell command. Subject to safety checks.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "command": {"type": "string", "description": "The shell command to execute"}
-            },
-            "required": ["command"],
-        },
-    },
-    {
-        "name": "read_file",
-        "description": "Read the contents of a file.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Path to the file to read"}
-            },
-            "required": ["path"],
-        },
-    },
-    {
-        "name": "write_file",
-        "description": "Write content to a file, creating directories as needed.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Path to write to"},
-                "content": {"type": "string", "description": "Content to write"},
-            },
-            "required": ["path", "content"],
-        },
-    },
-    {
-        "name": "web_search",
-        "description": "Search the web (placeholder).",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query"}
-            },
-            "required": ["query"],
-        },
-    },
-    {
-        "name": "save_memory",
+    {"type": "function", "function": {"name": "run_command", "description": "Run a shell command. Subject to safety checks.",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "The shell command to execute"}}, "required": ["command"]}}},
+    {"type": "function", "function": {"name": "read_file", "description": "Read the contents of a file.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Path to the file to read"}}, "required": ["path"]}}},
+    {"type": "function", "function": {"name": "write_file", "description": "Write content to a file, creating directories as needed.",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Path to write to"}, "content": {"type": "string", "description": "Content to write"}}, "required": ["path", "content"]}}},
+    {"type": "function", "function": {"name": "web_search", "description": "Search the web (placeholder).",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Search query"}}, "required": ["query"]}}},
+    {"type": "function", "function": {"name": "save_memory",
         "description": "Save an important fact or piece of knowledge to long-term memory. Use for user preferences, facts, and important context.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "topic": {"type": "string", "description": "Topic/category for the memory (e.g., 'user-preferences', 'project-details')"},
-                "content": {"type": "string", "description": "The information to remember"},
-            },
-            "required": ["topic", "content"],
-        },
-    },
-    {
-        "name": "memory_search",
+        "parameters": {"type": "object", "properties": {
+            "topic": {"type": "string", "description": "Topic/category for the memory (e.g., 'user-preferences', 'project-details')"},
+            "content": {"type": "string", "description": "The information to remember"},
+        }, "required": ["topic", "content"]}}},
+    {"type": "function", "function": {"name": "memory_search",
         "description": "Search long-term memory for previously saved knowledge. Use before answering questions about the user or recalling past context.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search keywords"}
-            },
-            "required": ["query"],
-        },
-    },
+        "parameters": {"type": "object", "properties": {"query": {"type": "string", "description": "Search keywords"}}, "required": ["query"]}}},
 ]
 
 
-def execute_tool(name: str, input: dict) -> str:
+def execute_tool(name: str, args: dict) -> str:
     if name == "run_command":
-        command = input["command"]
+        command = args["command"]
         safety = check_command_safety(command)
         if safety == "blocked":
             return f"BLOCKED: Command '{command}' matches a dangerous pattern."
         if safety == "needs_approval":
             save_approval(command)
         try:
-            result = subprocess.run(
-                command, shell=True, capture_output=True, text=True, timeout=30,
-            )
-            output = result.stdout + result.stderr
-            return output[:10000] or "Command completed with no output."
+            result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
+            return (result.stdout + result.stderr)[:10000] or "Command completed with no output."
         except subprocess.TimeoutExpired:
             return "Error: Command timed out."
         except Exception as e:
             return f"Error: {e}"
     elif name == "read_file":
         try:
-            return Path(input["path"]).read_text()[:10000]
+            return Path(args["path"]).read_text()[:10000]
         except Exception as e:
             return f"Error reading file: {e}"
     elif name == "write_file":
         try:
-            path = Path(input["path"])
+            path = Path(args["path"])
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(input["content"])
-            return f"Wrote {len(input['content'])} chars to {input['path']}"
+            path.write_text(args["content"])
+            return f"Wrote {len(args['content'])} chars to {args['path']}"
         except Exception as e:
             return f"Error writing file: {e}"
     elif name == "web_search":
-        return f"[Web search placeholder] Query: {input['query']}"
+        return f"[Web search placeholder] Query: {args['query']}"
     elif name == "save_memory":
-        return save_memory(input["topic"], input["content"])
+        return save_memory(args["topic"], args["content"])
     elif name == "memory_search":
-        return memory_search(input["query"])
+        return memory_search(args["query"])
     return f"Unknown tool: {name}"
 
 
@@ -336,58 +279,46 @@ def save_session(user_id: str, messages: list[dict]):
 # --- Agent loop ---
 
 def run_agent_turn(user_id: str, user_text: str) -> str:
-    messages = load_session(user_id)
-    messages.append({"role": "user", "content": user_text})
+    history = load_session(user_id)
+    history.append({"role": "user", "content": user_text})
 
-    tokens = estimate_tokens(messages)
+    tokens = estimate_tokens(history)
     if tokens > TOKEN_THRESHOLD:
         print(f"  [compaction] Session has ~{tokens} tokens, compacting...")
-        messages = compact_session(messages)
-        save_session(user_id, messages)
+        history = compact_session(history)
+        save_session(user_id, history)
 
     while True:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            system=SOUL,
-            tools=TOOLS,
-            messages=messages,
+        messages = [{"role": "system", "content": SOUL}] + history
+        response = client.chat.completions.create(
+            model=MODEL, max_tokens=4096, tools=TOOLS, messages=messages,
         )
+        msg = response.choices[0].message
 
-        assistant_content = []
-        for block in response.content:
-            if hasattr(block, "text"):
-                assistant_content.append({"type": "text", "text": block.text})
-            elif block.type == "tool_use":
-                assistant_content.append({
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": block.input,
-                })
+        assistant_msg = {"role": "assistant", "content": msg.content or ""}
+        if msg.tool_calls:
+            assistant_msg["tool_calls"] = [
+                {"id": tc.id, "type": "function",
+                 "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                for tc in msg.tool_calls
+            ]
+        history.append(assistant_msg)
 
-        messages.append({"role": "assistant", "content": assistant_content})
+        if not msg.tool_calls:
+            save_session(user_id, history)
+            return msg.content or "Done."
 
-        if response.stop_reason != "tool_use":
-            save_session(user_id, messages)
-            text_parts = [b.text for b in response.content if hasattr(b, "text")]
-            return "\n".join(text_parts) or "Done."
-
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                print(f"  [tool] {block.name}({json.dumps(block.input)[:100]})")
-                result = execute_tool(block.name, block.input)
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result,
-                })
-
-        messages.append({"role": "user", "content": tool_results})
+        for tc in msg.tool_calls:
+            try:
+                tool_args = json.loads(tc.function.arguments) if tc.function.arguments else {}
+            except json.JSONDecodeError:
+                tool_args = {}
+            print(f"  [tool] {tc.function.name}({json.dumps(tool_args)[:100]})")
+            result = execute_tool(tc.function.name, tool_args)
+            history.append({"role": "tool", "tool_call_id": tc.id, "content": result})
 
 
-# --- Channel: Telegram ---
+# --- Channels ---
 
 async def handle_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = str(update.effective_user.id)
@@ -405,8 +336,6 @@ def start_telegram():
     app.run_polling()
 
 
-# --- Channel: HTTP ---
-
 flask_app = Flask(__name__)
 
 
@@ -421,23 +350,44 @@ def http_chat():
 
 @flask_app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "model": MODEL})
 
 
 def start_http():
+    print("[http] Server running on http://localhost:5000")
     flask_app.run(host="0.0.0.0", port=5000, debug=False)
 
 
-# --- Main ---
+def start_cli():
+    user_id = "cli-user"
+    print(f"[cli] OpenClaw — model: {MODEL}. Type 'exit' to quit.\n")
+    while True:
+        try:
+            user_text = input("you> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if user_text in {"exit", "quit"}:
+            break
+        if not user_text:
+            continue
+        reply = run_agent_turn(user_id, user_text)
+        print(f"bot> {reply}\n")
+
 
 def main():
-    print("Starting bot with long-term memory...")
-    print(f"  Memory directory: {MEMORY_DIR}")
+    print(f"OpenClaw 08 — memory at {MEMORY_DIR}")
 
-    http_thread = threading.Thread(target=start_http, daemon=True)
-    http_thread.start()
+    has_telegram = "--telegram" in sys.argv
+    has_http = "--http" in sys.argv or has_telegram
 
-    start_telegram()
+    if has_http:
+        threading.Thread(target=start_http, daemon=True).start()
+
+    if has_telegram:
+        start_telegram()
+    else:
+        start_cli()
 
 
 if __name__ == "__main__":
